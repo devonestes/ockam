@@ -1,5 +1,56 @@
 ["setup.exs"] |> Enum.map(&Code.require_file/1)
 
+defmodule RendezvousWorker do
+  use Ockam.Worker
+
+  alias Ockam.Message
+  alias Ockam.Router
+
+  @impl true
+  def setup(_options, state) do
+    {:ok, Map.put(state, :client_info, %{})}
+  end
+
+  @impl true
+  def handle_message(message, %{address: address} = state) do
+    {reply_payload, state} = process_payload(message, state)
+
+    message
+    |> Message.reply(address, reply_payload)
+    |> Router.route()
+
+    {:ok, state}
+  end
+
+  defp process_payload(%{payload: "CONNECT " <> client_name} = message, state) do
+    state =
+      Map.update!(state, :client_info, fn client_info ->
+        Map.put(client_info, client_name, find_public_address(message.return_route))
+      end)
+
+    {"CONNECTED", state}
+  end
+
+  defp process_payload(%{payload: "GET_ADDRESS " <> client_name}, state) do
+    address = Map.get(state.client_info, client_name, "NOT_FOUND")
+    {"ADDRESS #{address}", state}
+  end
+
+  defp process_payload(message, state) do
+    IO.puts("Rendezvous received unexpected message: #{inspect(message)}")
+    {"ADDRESS NOT_FOUND", state}
+  end
+
+  defp find_public_address(route) do
+    Enum.find_value(route, fn step ->
+      case step do
+        %Ockam.Address{type: 2, value: value} -> value
+        _ -> nil
+      end
+    end)
+  end
+end
+
 defmodule RendezvousServer do
   use GenServer
 
@@ -8,129 +59,92 @@ defmodule RendezvousServer do
   end
 
   def init(port) do
-    {:ok, socket} = :gen_udp.open(port, [:binary, {:active, true}])
-    IO.puts("SERVER: Rendezvous server started on port #{port}")
-    {:ok, {socket, %{}}}
-  end
-
-  def handle_info({:udp, _socket, {ip1, ip2, ip3, ip4} = ip_tuple, port, message}, {socket, state}) do
-    ip = "#{ip1}.#{ip2}.#{ip3}.#{ip4}"
-    IO.puts("SERVER: Received message from #{ip}:#{port}: #{message}")
-
-    state =
-      case String.split(message, " ") do
-        ["CONNECT", client_name] ->
-          {:ok, updated_state} = store_client_info(client_name, ip, port, state)
-          reply_to_client(socket, ip_tuple, port, "CONNECTED")
-          updated_state
-
-        ["GET_ADDRESS", client_name] ->
-          ip = Map.get(state, client_name, "MISSING")
-          reply_to_client(socket, ip_tuple, port, "ADDRESS #{ip}")
-          state
-
-        _ ->
-          IO.puts("SERVER: Received unexpected message: #{message}")
-          state
-      end
-
-    {:noreply, {socket, state}}
-  end
-
-  defp reply_to_client(socket, ip, port, message) do
-    :gen_udp.send(socket, ip, port, message)
-  end
-
-  defp store_client_info(client_name, client_ip, client_port, state) do
-    {:ok, Map.put(state, client_name, "#{client_ip}:#{client_port}")}
+    {:ok, _listener} = Ockam.Transport.UDP.start(port: port)
+    {:ok, _worker} = RendezvousWorker.create(address: "rendezvous")
+    IO.puts("Rendezvous server started on port #{port}")
+    {:ok, nil}
   end
 end
 
-defmodule RendezvousClient do
+defmodule Puncher do
   use GenServer
 
-  # Replace with the IP address of your Rendezvous server
-  @server_ip {127, 0, 0, 1}
+  alias Ockam.Transport.UDPAddress
+  alias Ockam.Transport.UDP
 
-  # Replace with the UDP port of your Rendezvous server
-  @server_port 4000
-
-  def start_link(this_name, that_name) do
-    GenServer.start_link(__MODULE__, %{this_name: this_name, that_name: that_name})
+  def start_link(this_name, that_name, rendezvous_ip, rendezvous_port, port, retry_interval) do
+    GenServer.start_link(__MODULE__, %{
+      this_name: this_name,
+      that_name: that_name,
+      rendezvous_address: UDPAddress.new(rendezvous_ip, rendezvous_port),
+      port: port,
+      retry_interval: retry_interval
+    })
   end
 
   def init(args) do
-    {:ok, socket} = :gen_udp.open(0, [:binary])
-    {:ok, {socket, args}, {:continue, nil}}
+    Ockam.Node.register_address(args.this_name)
+    UDP.start(port: args.port)
+    {:ok, args, {:continue, nil}}
   end
 
-  def handle_continue(_, {socket, %{this_name: this_name} = args}) do
-    register_this(socket, this_name)
-    {:noreply, {socket, args}}
+  def handle_continue(_, state) do
+    send_message(state, "CONNECT #{state.this_name}")
+    {:noreply, state}
   end
 
-  defp register_this(socket, this_name) do
-    IO.puts("CLIENT: Registering #{this_name}")
-    connect_message = "CONNECT #{this_name}"
-    send_message(socket, connect_message)
+  def handle_info(%{payload: "CONNECTED"} = _message, state) do
+    send_message(state, "GET_ADDRESS #{state.that_name}")
+    {:noreply, state}
   end
 
-  defp wait_for_hole(socket, that_name) do
-    IO.puts("CLIENT: Waiting for hole to be punched")
-    send_message(socket, "GET_ADDRESS #{that_name}")
+  def handle_info(%{payload: "ADDRESS NOT_FOUND"} = _message, state) do
+    :timer.sleep(state.retry_interval)
+    send_message(state, "GET_ADDRESS #{state.that_name}")
+    {:noreply, state}
   end
 
-  defp send_message(socket, message) do
-    :gen_udp.send(socket, @server_ip, @server_port, message)
+  def handle_info(%{payload: "ADDRESS " <> address} = _message, state) do
+    IO.puts("Hole punched from #{state.this_name} to #{state.that_name} at #{address}")
+    send_direct_messages(address, state.this_name, state.that_name)
+    {:noreply, state}
   end
 
-  def handle_info({:udp, _socket, _ip, _port, "CONNECTED"}, {socket, %{that_name: that_name} = state}) do
-    IO.puts("CLIENT: Connected, requesting #{that_name} info")
-    wait_for_hole(socket, that_name)
-    {:noreply, {socket, state}}
+  def handle_info(%{payload: payload} = _message, state) do
+    IO.puts("Received unexpected payload: #{inspect(payload)}")
+    {:noreply, state}
   end
 
-  def handle_info({:udp, _socket, _ip, _port, "ADDRESS MISSING"}, {socket, %{that_name: that_name} = state}) do
-    :timer.sleep(100)
-    wait_for_hole(socket, that_name)
-    {:noreply, {socket, state}}
-  end
+  defp send_direct_messages(address, this_name, that_name) do
+    for num <- 0..5 do
+      Ockam.Router.route(%{
+        onward_route: [UDPAddress.new(address), that_name],
+        return_route: [this_name],
+        payload: "Message #{num} from #{this_name} to #{that_name}"
+      })
 
-  def handle_info({:udp, _socket, _ip, _port, "ADDRESS " <> ip}, {socket, %{this_name: this_name, that_name: that_name} = state}) do
-    IO.puts("CLIENT: Hole punched #{that_name} - #{ip}")
-    regex = ~r|(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3}):(\d{1,5})|
-    results = Regex.run(regex, ip)
-    [_, ip1, ip2, ip3, ip4, that_port] = Enum.map(results, fn num ->
-      {int, _} = Integer.parse(num)
-      int
-    end)
-
-    that_ip = {ip1, ip2, ip3, ip4}
-
-    for num <- 0..9 do
-      :gen_udp.send(socket, that_ip, that_port,  "Message #{num} from #{this_name} to #{that_name}")
+      :timer.sleep(30)
     end
-
-    #:gen_udp.close(socket)
-
-    {:noreply, {socket, state}}
   end
 
-  def handle_info({:udp, _socket, _ip, _port, message}, {socket, state}) do
-    IO.puts("CLIENT: received #{message}")
-    {:noreply, {socket, state}}
+  defp send_message(state, payload) do
+    Ockam.Router.route(%{
+      onward_route: [state.rendezvous_address, "rendezvous"],
+      return_route: [state.this_name],
+      payload: payload
+    })
   end
 end
 
 # Start the Rendezvous server
 RendezvousServer.start_link(4000)
 
-:timer.sleep(100)
+# Start Alice, looking for Bob
+Puncher.start_link("alice", "bob", "127.0.0.1", 4000, 3001, 100)
 
-# Start Alice
-RendezvousClient.start_link("alice", "bob")
+:timer.sleep(10)
 
-:timer.sleep(100)
+# Start Bob, looking for Alice
+Puncher.start_link("bob", "alice", "127.0.0.1", 4000, 3002, 100)
 
-# Start Bob
-RendezvousClient.start_link("bob", "alice")
+:timer.sleep(5000)
